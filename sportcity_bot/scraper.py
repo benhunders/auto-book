@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import shutil
 from datetime import datetime, timedelta
 
 from playwright.async_api import Page, async_playwright
@@ -355,7 +357,12 @@ async def scrape_schedule(url: str) -> list[Lesson]:
     all_lessons: list[Lesson] = []
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        # Use CHROMIUM_PATH env var if set, otherwise let Playwright find it
+        chromium_path = os.environ.get("CHROMIUM_PATH") or None
+        browser = await pw.chromium.launch(
+            headless=True,
+            **({"executable_path": chromium_path} if chromium_path else {}),
+        )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             locale="nl-NL",
