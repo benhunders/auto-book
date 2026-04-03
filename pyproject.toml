@@ -1,0 +1,21 @@
+[project]
+name = "sportcity-auto-book"
+version = "0.1.0"
+description = "SportCity group lesson auto-booking bot with Telegram notifications"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.40.0",
+    "python-telegram-bot>=21.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.1.0",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+sportcity-bot = "sportcity_bot.main:main"
