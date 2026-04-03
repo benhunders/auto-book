@@ -16,8 +16,9 @@ import json
 import logging
 import os
 import re
-import shutil
-from datetime import datetime, timedelta
+import tempfile
+from datetime import datetime
+from pathlib import Path
 
 from playwright.async_api import Page, async_playwright
 
@@ -25,17 +26,18 @@ from .models import Lesson
 
 logger = logging.getLogger(__name__)
 
+# Where to store debug output (screenshot + HTML)
+DEBUG_DIR = Path(tempfile.gettempdir()) / "sportcity_debug"
+
+
 # ---------------------------------------------------------------------------
-# JS extraction script injected into the page.  It tries several strategies
-# to pull structured lesson data out of the Virtuagym schedule widget.
+# JS extraction script injected into the page.
 # ---------------------------------------------------------------------------
 EXTRACT_LESSONS_JS = """
 () => {
     const lessons = [];
 
     // --- Strategy 1: look for Virtuagym event blocks ---
-    // Virtuagym widgets typically render events inside elements with class
-    // names like "event", "schedule-event", "class-event", etc.
     const eventSelectors = [
         '.event', '.schedule-event', '.class-event',
         '[class*="event"]', '[class*="class-item"]',
@@ -47,20 +49,14 @@ EXTRACT_LESSONS_JS = """
     for (const selector of eventSelectors) {
         const elements = document.querySelectorAll(selector);
         for (const el of elements) {
-            // Skip tiny/invisible elements
             if (el.offsetHeight < 10) continue;
-
             const text = el.innerText || el.textContent || '';
             if (text.trim().length < 3) continue;
 
-            // Try to extract structured data from data attributes first
             const data = el.dataset || {};
-            const name = data.eventName || data.className || data.name || '';
-            const time = data.time || data.startTime || '';
-
             lessons.push({
-                name: name,
-                time: time,
+                name: data.eventName || data.className || data.name || '',
+                time: data.time || data.startTime || '',
                 text: text.trim().substring(0, 500),
                 html: el.innerHTML.substring(0, 1000),
                 tag: el.tagName,
@@ -70,48 +66,38 @@ EXTRACT_LESSONS_JS = """
         }
     }
 
-    // --- Strategy 2: look for table rows in a timetable ---
+    // --- Strategy 2: table rows ---
     const tables = document.querySelectorAll('table');
     for (const table of tables) {
-        const rows = table.querySelectorAll('tr');
-        for (const row of rows) {
+        for (const row of table.querySelectorAll('tr')) {
             const cells = row.querySelectorAll('td, th');
             if (cells.length >= 2) {
                 const text = row.innerText || '';
                 if (text.trim().length > 5) {
                     lessons.push({
-                        name: '',
-                        time: '',
+                        name: '', time: '',
                         text: text.trim().substring(0, 500),
                         html: row.innerHTML.substring(0, 1000),
-                        tag: 'TR',
-                        classes: row.className,
-                        dataAttrs: '{}',
+                        tag: 'TR', classes: row.className, dataAttrs: '{}',
                     });
                 }
             }
         }
     }
 
-    // --- Strategy 3: look for iframes (Virtuagym may be in an iframe) ---
-    const iframes = document.querySelectorAll('iframe');
-    const iframeInfo = [];
-    for (const iframe of iframes) {
-        iframeInfo.push({
-            src: iframe.src || '',
-            id: iframe.id || '',
-            name: iframe.name || '',
-        });
+    // --- Strategy 3: iframes ---
+    const iframes = [];
+    for (const iframe of document.querySelectorAll('iframe')) {
+        iframes.push({ src: iframe.src || '', id: iframe.id || '', name: iframe.name || '' });
     }
 
-    // --- Strategy 4: capture any XHR/fetch data that looks like schedule JSON ---
-    // (This checks for data stored in window/global variables)
+    // --- Strategy 4: global JS variables ---
     const globals = [];
     for (const key of Object.keys(window)) {
         try {
             const val = window[key];
             if (val && typeof val === 'object' && !Array.isArray(val)) {
-                const str = JSON.stringify(val).substring(0, 200);
+                const str = JSON.stringify(val).substring(0, 300);
                 if (/class|event|lesson|schedule|rooster/i.test(str)) {
                     globals.push({ key, preview: str });
                 }
@@ -120,9 +106,7 @@ EXTRACT_LESSONS_JS = """
     }
 
     return {
-        lessons,
-        iframes: iframeInfo,
-        globals,
+        lessons, iframes, globals,
         title: document.title,
         url: window.location.href,
         bodyLength: document.body.innerHTML.length,
@@ -132,36 +116,59 @@ EXTRACT_LESSONS_JS = """
 
 
 async def _accept_cookies(page: Page) -> None:
-    """Try to dismiss cookie consent banners."""
-    cookie_selectors = [
+    """Try to dismiss cookie / consent banners aggressively."""
+    # Cookiebot is used on sportcity.nl — try its specific button first
+    selectors = [
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#CybotCookiebotDialogBodyButtonAccept",
+        "button:has-text('Alles accepteren')",
+        "button:has-text('Alle cookies accepteren')",
         "button:has-text('Accepteer')",
+        "button:has-text('Accept all')",
         "button:has-text('Accept')",
         "button:has-text('Akkoord')",
         "button:has-text('OK')",
         "[id*='cookie'] button",
         "[class*='cookie'] button",
         "[id*='consent'] button",
+        "a:has-text('Accepteer')",
+        "a:has-text('Accept')",
     ]
-    for selector in cookie_selectors:
+    for selector in selectors:
         try:
             btn = page.locator(selector).first
-            if await btn.is_visible(timeout=1000):
+            if await btn.is_visible(timeout=1500):
                 await btn.click()
-                await page.wait_for_timeout(500)
+                logger.info("Dismissed cookie banner with: %s", selector)
+                await page.wait_for_timeout(1000)
                 return
         except Exception:
             continue
+    logger.info("No cookie banner found (or already dismissed)")
 
 
-async def _find_and_enter_iframe(page: Page) -> Page | None:
-    """If the schedule is inside an iframe, return a handle to its content."""
-    iframes = page.frames
-    for frame in iframes:
-        url = frame.url
-        if "virtuagym" in url or "classes" in url or "schedule" in url:
-            logger.info("Found schedule iframe: %s", url)
-            return frame  # type: ignore[return-value]
-    return None
+async def _wait_for_schedule(page: Page) -> None:
+    """Wait for the schedule widget to appear on the page."""
+    # Try various selectors that a schedule widget might match
+    schedule_selectors = [
+        "[class*='schedule']",
+        "[class*='rooster']",
+        "[class*='timetable']",
+        "[class*='calendar']",
+        "[class*='event']",
+        "[class*='virtuagym']",
+        "iframe[src*='virtuagym']",
+        "iframe[src*='classes']",
+        "table",
+    ]
+    for selector in schedule_selectors:
+        try:
+            await page.wait_for_selector(selector, timeout=5000)
+            logger.info("Schedule widget detected with selector: %s", selector)
+            return
+        except Exception:
+            continue
+    logger.warning("No schedule widget detected after waiting")
 
 
 async def _intercept_api_calls(page: Page) -> list[dict]:
@@ -172,7 +179,7 @@ async def _intercept_api_calls(page: Page) -> list[dict]:
         url = response.url
         if any(
             kw in url.lower()
-            for kw in ["class", "event", "schedule", "lesson", "rooster"]
+            for kw in ["class", "event", "schedule", "lesson", "rooster", "virtuagym"]
         ):
             try:
                 body = await response.json()
@@ -196,14 +203,12 @@ def _parse_lessons_from_raw(raw: dict) -> list[Lesson]:
         if not lines:
             continue
 
-        # Try to parse name, time, instructor from the text lines
         name = item.get("name") or (lines[0] if lines else "Unknown")
         time_str = item.get("time", "")
         instructor = ""
         time_start = ""
         time_end = ""
 
-        # Look for time pattern HH:MM in the text
         time_pattern = re.compile(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})")
         single_time = re.compile(r"(\d{1,2}:\d{2})")
 
@@ -224,7 +229,6 @@ def _parse_lessons_from_raw(raw: dict) -> list[Lesson]:
                 if m:
                     time_start = m.group(1)
 
-        # Check for availability indicators
         bookable = False
         spots_available = None
         spots_total = None
@@ -244,11 +248,9 @@ def _parse_lessons_from_raw(raw: dict) -> list[Lesson]:
                 kw in text_lower
                 for kw in ["beschikbaar", "available", "boek", "book", "inschrijven"]
             )
-            # "vol" = full in Dutch
             if any(kw in text_lower for kw in ["vol", "full", "sold out", "volgeboekt"]):
                 bookable = False
 
-        # Use today's date as fallback — we'll refine with actual date from page
         date = datetime.now().strftime("%Y-%m-%d")
 
         lesson = Lesson(
@@ -276,12 +278,10 @@ def _parse_lessons_from_api(api_data: list[dict]) -> list[Lesson]:
 
     for entry in api_data:
         data = entry.get("data", {})
-        # Virtuagym API typically returns a list of events
         events = []
         if isinstance(data, list):
             events = data
         elif isinstance(data, dict):
-            # Could be nested: {"data": [...], "result": [...], "events": [...]}
             for key in ("data", "result", "events", "classes", "items"):
                 if isinstance(data.get(key), list):
                     events = data[key]
@@ -343,21 +343,12 @@ def _parse_lessons_from_api(api_data: list[dict]) -> list[Lesson]:
     return lessons
 
 
-async def scrape_schedule(url: str) -> list[Lesson]:
-    """Scrape the SportCity group lesson schedule and return available lessons.
-
-    Uses a headless Chromium browser to:
-    1. Load the schedule page
-    2. Dismiss cookie banners
-    3. Intercept API calls for schedule data
-    4. Extract lesson info from the rendered DOM
-    5. Check for iframe-embedded schedules
-    """
+async def scrape_schedule(url: str, debug: bool = False) -> list[Lesson]:
+    """Scrape the SportCity group lesson schedule and return available lessons."""
     logger.info("Scraping schedule from %s", url)
     all_lessons: list[Lesson] = []
 
     async with async_playwright() as pw:
-        # Use CHROMIUM_PATH env var if set, otherwise let Playwright find it
         chromium_path = os.environ.get("CHROMIUM_PATH") or None
         browser = await pw.chromium.launch(
             headless=True,
@@ -367,8 +358,8 @@ async def scrape_schedule(url: str) -> list[Lesson]:
             viewport={"width": 1280, "height": 900},
             locale="nl-NL",
             user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
             ),
         )
         page = await context.new_page()
@@ -376,66 +367,120 @@ async def scrape_schedule(url: str) -> list[Lesson]:
         # Set up API interception before navigating
         api_data = await _intercept_api_calls(page)
 
+        # Also capture ALL network requests for debugging
+        network_log: list[str] = []
+
+        def log_request(request):
+            network_log.append(f">> {request.method} {request.url}")
+
+        def log_response(response):
+            network_log.append(f"<< {response.status} {response.url}")
+
+        if debug:
+            page.on("request", log_request)
+            page.on("response", log_response)
+
         try:
             await page.goto(url, wait_until="networkidle", timeout=30_000)
         except Exception as e:
             logger.warning("Page load timeout/error (continuing anyway): %s", e)
 
-        # Dismiss cookie banners
+        # Step 1: Dismiss cookie banners (critical — blocks content on sportcity.nl)
         await _accept_cookies(page)
 
-        # Wait a bit for dynamic content to load
+        # Step 2: Wait for schedule widget to load after cookies are accepted
+        await page.wait_for_timeout(3000)
+        await _wait_for_schedule(page)
+
+        # Step 3: Give extra time for dynamic content after schedule container appears
         await page.wait_for_timeout(3000)
 
-        # Check for iframe-embedded schedule
-        schedule_frame = await _find_and_enter_iframe(page)
-        target = schedule_frame or page
+        # Step 4: Explore all frames (main page + iframes)
+        all_frames = page.frames
+        logger.info("Page has %d frames total", len(all_frames))
 
-        # Extract lesson data from the DOM
-        try:
-            raw = await target.evaluate(EXTRACT_LESSONS_JS)
-            logger.info(
-                "DOM extraction: %d lesson elements, %d iframes, %d globals, body=%d chars",
-                len(raw.get("lessons", [])),
-                len(raw.get("iframes", [])),
-                len(raw.get("globals", [])),
-                raw.get("bodyLength", 0),
-            )
+        for i, frame in enumerate(all_frames):
+            frame_url = frame.url
+            logger.info("  Frame %d: %s", i, frame_url[:120] if frame_url else "(empty)")
 
-            # If there are iframes we haven't explored, log them
-            for iframe in raw.get("iframes", []):
-                logger.info("  iframe: src=%s", iframe.get("src", ""))
+            # Extract from every frame that might have content
+            try:
+                raw = await frame.evaluate(EXTRACT_LESSONS_JS)
 
-            dom_lessons = _parse_lessons_from_raw(raw)
-            all_lessons.extend(dom_lessons)
-        except Exception as e:
-            logger.error("DOM extraction failed: %s", e)
+                n_lessons = len(raw.get("lessons", []))
+                n_iframes = len(raw.get("iframes", []))
+                n_globals = len(raw.get("globals", []))
+                body_len = raw.get("bodyLength", 0)
+
+                if n_lessons > 0 or n_globals > 0 or body_len > 1000:
+                    logger.info(
+                        "  Frame %d extraction: %d elements, %d globals, body=%d chars",
+                        i, n_lessons, n_globals, body_len,
+                    )
+
+                    for g in raw.get("globals", []):
+                        logger.info("    Global: %s = %s", g["key"], g["preview"][:200])
+
+                dom_lessons = _parse_lessons_from_raw(raw)
+                existing_uids = {l.uid for l in all_lessons}
+                for lesson in dom_lessons:
+                    if lesson.uid not in existing_uids:
+                        all_lessons.append(lesson)
+
+            except Exception as e:
+                logger.debug("  Frame %d extraction failed: %s", i, e)
 
         # Parse any intercepted API data
         api_lessons = _parse_lessons_from_api(api_data)
-        # Merge, preferring API data (more structured)
         existing_uids = {l.uid for l in all_lessons}
         for lesson in api_lessons:
             if lesson.uid not in existing_uids:
                 all_lessons.append(lesson)
 
-        # Debug: save a screenshot for troubleshooting
-        try:
-            await page.screenshot(path="/tmp/sportcity_schedule.png", full_page=True)
-            logger.info("Debug screenshot saved to /tmp/sportcity_schedule.png")
-        except Exception:
-            pass
+        # Save debug info
+        if debug:
+            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                await page.screenshot(
+                    path=str(DEBUG_DIR / "screenshot.png"), full_page=True
+                )
+                logger.info("Screenshot saved to %s", DEBUG_DIR / "screenshot.png")
+            except Exception as e:
+                logger.warning("Screenshot failed: %s", e)
 
-        # Debug: save page HTML
-        try:
-            html = await page.content()
-            with open("/tmp/sportcity_schedule.html", "w") as f:
-                f.write(html)
-            logger.info("Debug HTML saved to /tmp/sportcity_schedule.html")
-        except Exception:
-            pass
+            try:
+                html = await page.content()
+                (DEBUG_DIR / "page.html").write_text(html, encoding="utf-8")
+                logger.info("HTML saved to %s", DEBUG_DIR / "page.html")
+            except Exception as e:
+                logger.warning("HTML save failed: %s", e)
+
+            try:
+                (DEBUG_DIR / "network.log").write_text(
+                    "\n".join(network_log), encoding="utf-8"
+                )
+                logger.info("Network log saved to %s", DEBUG_DIR / "network.log")
+                logger.info("Captured %d API responses", len(api_data))
+                for entry in api_data:
+                    logger.info("  API: %s", entry["url"][:150])
+            except Exception as e:
+                logger.warning("Network log save failed: %s", e)
+
+            if api_data:
+                try:
+                    (DEBUG_DIR / "api_responses.json").write_text(
+                        json.dumps(api_data, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    logger.info("API responses saved to %s", DEBUG_DIR / "api_responses.json")
+                except Exception:
+                    pass
 
         await browser.close()
 
-    logger.info("Scraped %d total lessons (%d bookable)", len(all_lessons), sum(1 for l in all_lessons if l.bookable))
+    logger.info(
+        "Scraped %d total lessons (%d bookable)",
+        len(all_lessons),
+        sum(1 for l in all_lessons if l.bookable),
+    )
     return all_lessons

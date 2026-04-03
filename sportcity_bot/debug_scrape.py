@@ -2,16 +2,17 @@
 
 Usage:
     python -m sportcity_bot.debug_scrape [URL]
+
+Saves debug output (screenshot, HTML, network log) to a temp directory.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
 
-from .scraper import scrape_schedule
+from .scraper import DEBUG_DIR, scrape_schedule
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,13 +24,20 @@ DEFAULT_URL = "https://www.sportcity.nl/utrecht/leidsche-rijn-sportpark/groepsle
 
 async def main() -> None:
     url = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_URL
-    print(f"Scraping: {url}\n")
+    print(f"Scraping: {url}")
+    print(f"Debug output will be saved to: {DEBUG_DIR}\n")
 
-    lessons = await scrape_schedule(url)
+    lessons = await scrape_schedule(url, debug=True)
+
+    print(f"\n{'='*60}")
 
     if not lessons:
         print("No lessons found!")
-        print("Check /tmp/sportcity_schedule.png and /tmp/sportcity_schedule.html for debug info.")
+        print(f"\nCheck these debug files:")
+        print(f"  Screenshot: {DEBUG_DIR / 'screenshot.png'}")
+        print(f"  Page HTML:  {DEBUG_DIR / 'page.html'}")
+        print(f"  Network:    {DEBUG_DIR / 'network.log'}")
+        print(f"\nPlease share the screenshot so we can see what the page looks like.")
         return
 
     print(f"Found {len(lessons)} lessons:\n")
