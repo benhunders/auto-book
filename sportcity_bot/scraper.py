@@ -425,9 +425,79 @@ def _parse_dom_schedule(raw: dict) -> list[Lesson]:
     return lessons
 
 
-async def _scrape_with_playwright(url: str, debug: bool = False) -> list[Lesson]:
-    """Scrape the schedule using a headless browser."""
-    logger.info("Playwright fallback: loading %s", url)
+async def _extract_current_week(page) -> dict:
+    """Extract schedule data from the currently visible week."""
+    # Scroll down to trigger lazy loading, then back up
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1500)
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(500)
+
+    return await page.evaluate(EXTRACT_SCHEDULE_JS)
+
+
+async def _click_next_week(page) -> bool:
+    """Click the forward arrow to go to the next week. Returns True if successful."""
+    # The arrow is next to "Week XX, DD mmm - DD mmm"
+    # Look for a clickable forward arrow element
+    next_selectors = [
+        "button:has-text('→')",
+        "a:has-text('→')",
+        "[class*='next']",
+        "[class*='forward']",
+        "[aria-label*='next']",
+        "[aria-label*='volgende']",
+    ]
+
+    # Also try: the right arrow near the week header
+    # From the screenshot it's a simple "→" link/button near the week title
+    for selector in next_selectors:
+        try:
+            btn = page.locator(selector).first
+            if await btn.is_visible(timeout=1000):
+                await btn.click()
+                await page.wait_for_timeout(3000)  # Wait for new week to load
+                return True
+        except Exception:
+            continue
+
+    # Fallback: try to find any clickable element with an arrow-right SVG or "›" text
+    # near the week header
+    try:
+        # Look for SVG arrows or link elements near "Week" text
+        arrow = page.locator(
+            "svg[class*='arrow'], svg[class*='right'], "
+            "a[href*='week'], button[class*='arrow'], "
+            "[class*='week'] a, [class*='week'] button, "
+            "[class*='navigation'] a:last-child, "
+            "[class*='navigation'] button:last-child"
+        ).last
+        if await arrow.is_visible(timeout=1000):
+            await arrow.click()
+            await page.wait_for_timeout(3000)
+            return True
+    except Exception:
+        pass
+
+    # Last resort: try keyboard navigation
+    try:
+        await page.keyboard.press("ArrowRight")
+        await page.wait_for_timeout(3000)
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def _scrape_with_playwright(
+    url: str, weeks_ahead: int = 2, debug: bool = False
+) -> list[Lesson]:
+    """Scrape the schedule for the current week plus future weeks."""
+    logger.info("Playwright: loading %s (weeks_ahead=%d)", url, weeks_ahead)
+
+    all_lessons: list[Lesson] = []
+    seen_uids: set[str] = set()
 
     async with async_playwright() as pw:
         chromium_path = os.environ.get("CHROMIUM_PATH") or None
@@ -466,46 +536,60 @@ async def _scrape_with_playwright(url: str, debug: bool = False) -> list[Lesson]
         # Wait for schedule content to render
         await page.wait_for_timeout(5000)
 
-        # Scroll down to trigger lazy loading
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(2000)
-        await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(1000)
+        # Scrape current week + future weeks
+        for week_num in range(1 + weeks_ahead):
+            week_label = f"week {week_num}" if week_num == 0 else f"week +{week_num}"
 
-        # Extract schedule data
-        raw = await page.evaluate(EXTRACT_SCHEDULE_JS)
-        logger.info(
-            "DOM extraction: %d time-pattern matches, %d date headers",
-            len(raw.get("results", [])),
-            len(raw.get("dateHeaders", [])),
-        )
+            raw = await _extract_current_week(page)
+            n_matches = len(raw.get("results", []))
+            n_dates = len(raw.get("dateHeaders", []))
+            logger.info(
+                "Extracted %s: %d lessons, %d date headers",
+                week_label, n_matches, n_dates,
+            )
 
-        if debug:
-            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                await page.screenshot(
-                    path=str(DEBUG_DIR / "screenshot.png"), full_page=True
-                )
-                logger.info("Screenshot: %s", DEBUG_DIR / "screenshot.png")
-            except Exception:
-                pass
-            try:
-                html = await page.content()
-                (DEBUG_DIR / "page.html").write_text(html, encoding="utf-8")
-                logger.info("HTML: %s", DEBUG_DIR / "page.html")
-            except Exception:
-                pass
-            try:
-                (DEBUG_DIR / "extraction.json").write_text(
-                    json.dumps(raw, indent=2, default=str), encoding="utf-8"
-                )
-                logger.info("Extraction data: %s", DEBUG_DIR / "extraction.json")
-            except Exception:
-                pass
+            # Parse lessons from this week
+            week_lessons = _parse_dom_schedule(raw)
+            for lesson in week_lessons:
+                if lesson.uid not in seen_uids:
+                    seen_uids.add(lesson.uid)
+                    all_lessons.append(lesson)
+
+            logger.info(
+                "  %s: %d unique lessons (running total: %d)",
+                week_label, len(week_lessons), len(all_lessons),
+            )
+
+            # Navigate to next week (unless this is the last iteration)
+            if week_num < weeks_ahead:
+                if not await _click_next_week(page):
+                    logger.warning("Could not navigate to next week, stopping")
+                    break
+
+            if debug and week_num == 0:
+                DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+                try:
+                    await page.screenshot(
+                        path=str(DEBUG_DIR / "screenshot.png"), full_page=True
+                    )
+                    logger.info("Screenshot: %s", DEBUG_DIR / "screenshot.png")
+                except Exception:
+                    pass
+                try:
+                    html = await page.content()
+                    (DEBUG_DIR / "page.html").write_text(html, encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    (DEBUG_DIR / "extraction.json").write_text(
+                        json.dumps(raw, indent=2, default=str), encoding="utf-8"
+                    )
+                except Exception:
+                    pass
 
         await browser.close()
 
-    return _parse_dom_schedule(raw)
+    return all_lessons
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +615,17 @@ def _extract_club_slug(url: str) -> str:
     return ""
 
 
-async def scrape_schedule(url: str, debug: bool = False) -> list[Lesson]:
-    """Scrape the SportCity schedule. Tries direct API first, falls back to Playwright."""
-    logger.info("Scraping schedule from %s", url)
+async def scrape_schedule(
+    url: str, weeks_ahead: int = 2, debug: bool = False
+) -> list[Lesson]:
+    """Scrape the SportCity schedule. Tries direct API first, falls back to Playwright.
+
+    Args:
+        url: The groepslesrooster page URL.
+        weeks_ahead: How many additional weeks to scrape beyond the current one.
+        debug: Save screenshots and extraction data for debugging.
+    """
+    logger.info("Scraping schedule from %s (%d weeks ahead)", url, weeks_ahead)
     club_slug = _extract_club_slug(url)
     logger.info("Club slug: %s", club_slug)
 
@@ -555,8 +647,8 @@ async def scrape_schedule(url: str, debug: bool = False) -> list[Lesson]:
 
         logger.info("Direct API did not return lessons, falling back to Playwright")
 
-    # Strategy 2: Playwright DOM extraction
-    lessons = await _scrape_with_playwright(url, debug=debug)
+    # Strategy 2: Playwright DOM extraction with week navigation
+    lessons = await _scrape_with_playwright(url, weeks_ahead=weeks_ahead, debug=debug)
     logger.info(
         "Playwright: found %d lessons (%d bookable)",
         len(lessons),

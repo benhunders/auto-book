@@ -275,7 +275,10 @@ async def _cb_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     from .config import settings
 
     try:
-        lessons = await scrape_schedule(settings.sportcity_schedule_url)
+        lessons = await scrape_schedule(
+            settings.sportcity_schedule_url,
+            weeks_ahead=settings.weeks_ahead,
+        )
         names = {l.name for l in lessons}
         context.application.bot_data["known_lesson_names"] = names
         await query.answer(f"Found {len(names)} lesson types!")

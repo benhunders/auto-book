@@ -27,7 +27,7 @@ async def main() -> None:
     print(f"Scraping: {url}")
     print(f"Debug output: {DEBUG_DIR}\n")
 
-    lessons = await scrape_schedule(url, debug=True)
+    lessons = await scrape_schedule(url, weeks_ahead=2, debug=True)
 
     print(f"\n{'='*60}")
 

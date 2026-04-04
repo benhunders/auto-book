@@ -82,7 +82,10 @@ class LessonMonitor:
         """Run a single check cycle. Returns newly found matching lessons."""
         logger.info("Running schedule check...")
         try:
-            lessons = await scrape_schedule(self.settings.sportcity_schedule_url)
+            lessons = await scrape_schedule(
+                self.settings.sportcity_schedule_url,
+                weeks_ahead=self.settings.weeks_ahead,
+            )
         except Exception as e:
             logger.error("Scrape failed: %s", e)
             return []

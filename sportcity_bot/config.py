@@ -16,14 +16,8 @@ class Settings(BaseSettings):
 
     poll_interval_seconds: int = 300
 
-    # Comma-separated lesson names to watch (empty = all lessons)
-    lesson_filter: str = ""
-
-    @property
-    def lesson_filter_list(self) -> list[str]:
-        if not self.lesson_filter:
-            return []
-        return [name.strip().lower() for name in self.lesson_filter.split(",")]
+    # How many weeks ahead to scrape (default: 2)
+    weeks_ahead: int = 2
 
 
 settings = Settings()  # type: ignore[call-arg]
