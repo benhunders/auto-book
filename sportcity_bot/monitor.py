@@ -87,9 +87,10 @@ class LessonMonitor:
             logger.error("Scrape failed: %s", e)
             return []
 
-        # Update bot status
+        # Update bot status and known lesson names for the picker UI
         self.app.bot_data["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.app.bot_data["lessons_found"] = len(lessons)
+        self.app.bot_data["known_lesson_names"] = {l.name for l in lessons}
 
         current_uids = {l.uid for l in lessons}
 
