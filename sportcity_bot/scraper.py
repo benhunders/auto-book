@@ -120,28 +120,50 @@ async def _find_club_id(client: httpx.AsyncClient, club_slug: str) -> int | None
 async def _fetch_classes_from_perfectgym(
     client: httpx.AsyncClient, club_id: int
 ) -> list[dict]:
-    """Fetch class schedule directly from PerfectGym API."""
+    """Fetch class schedule directly from PerfectGym API.
+
+    Tries multiple API endpoint patterns since the exact path varies
+    between PerfectGym versions and deployments.
+    """
     today = datetime.now()
     start = today.strftime("%Y-%m-%dT00:00:00")
     end = (today + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59")
 
-    url = f"{PERFECTGYM_API}/Api/Classes/Classes"
+    # Try multiple known PerfectGym API patterns
+    endpoints = [
+        f"{PERFECTGYM_API}/Api/v2/Classes/Classes",
+        f"{PERFECTGYM_API}/Api/Classes/Classes",
+        f"{PERFECTGYM_API}/Api/v2/GroupActivities/GroupActivities",
+        f"{PERFECTGYM_API}/Api/GroupActivities/GroupActivities",
+        f"{PERFECTGYM_API}/Api/v2/Calendar/Classes",
+        f"{PERFECTGYM_API}/Api/Calendar/Classes",
+    ]
+
     params = {"clubId": club_id, "startDate": start, "endDate": end}
 
-    try:
-        resp = await client.get(url, params=params, headers=HEADERS)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            for key in ("data", "result", "elements", "classes", "items"):
-                if isinstance(data.get(key), list):
-                    return data[key]
-        return []
-    except Exception as e:
-        logger.warning("PerfectGym Classes API failed: %s", e)
-        return []
+    for url in endpoints:
+        try:
+            resp = await client.get(url, params=params, headers=HEADERS)
+            if resp.status_code == 404:
+                logger.debug("PerfectGym endpoint not found: %s", url)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info("PerfectGym API success: %s", url)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("data", "result", "elements", "classes", "items"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+        except httpx.HTTPStatusError:
+            continue
+        except Exception as e:
+            logger.debug("PerfectGym endpoint error (%s): %s", url, e)
+            continue
+
+    logger.warning("No PerfectGym API endpoint returned classes")
+    return []
 
 
 async def _fetch_schedule_via_nextjs(
@@ -258,48 +280,48 @@ EXTRACT_SCHEDULE_JS = """
     // Each lesson shows: time range, name, duration, instructor, location.
     // We scan ALL text nodes looking for time patterns.
     const results = [];
-
-    // Get all elements and find ones that look like schedule entries
     const allElements = document.querySelectorAll('*');
 
     for (const el of allElements) {
-        // Only process leaf-ish elements (avoid duplicating parent text)
         if (el.children.length > 10) continue;
 
         const text = (el.innerText || el.textContent || '').trim();
         if (!text || text.length < 10 || text.length > 500) continue;
 
-        // Look for time pattern: HH:MM - HH:MM
         const timeMatch = text.match(/(\\d{1,2}:\\d{2})\\s*[-–]\\s*(\\d{1,2}:\\d{2})/);
         if (!timeMatch) continue;
 
-        // Check if this element also contains a class/lesson name
-        // (not just a standalone time)
         const afterTime = text.substring(text.indexOf(timeMatch[0]) + timeMatch[0].length).trim();
         if (afterTime.length < 2) continue;
+
+        // Track vertical position so we can map to date headers
+        const rect = el.getBoundingClientRect();
 
         results.push({
             text: text,
             timeStart: timeMatch[1],
             timeEnd: timeMatch[2],
             afterTime: afterTime,
+            y: rect.top,
             tag: el.tagName,
             classes: (el.className || '').substring(0, 200),
         });
     }
 
-    // Also look for date headers (e.g., "3 april", "4 april")
+    // Look for date headers (e.g., "3 april", "vrijdag", "zaterdag")
+    // They can appear as "3 april" or combined with day name
     const dateHeaders = [];
-    const datePattern = /^(\\d{1,2})\\s+(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)$/i;
+    const datePattern = /(\\d{1,2})\\s+(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)/i;
     for (const el of allElements) {
         const text = (el.innerText || el.textContent || '').trim();
+        if (text.length > 50) continue;
         const m = text.match(datePattern);
         if (m) {
             dateHeaders.push({
                 text: text,
                 day: parseInt(m[1]),
                 month: m[2].toLowerCase(),
-                rect: el.getBoundingClientRect().toJSON(),
+                y: el.getBoundingClientRect().top,
             });
         }
     }
@@ -320,9 +342,9 @@ def _parse_dom_schedule(raw: dict) -> list[Lesson]:
     lessons: list[Lesson] = []
     seen: set[str] = set()
 
-    # Build date mapping from headers
+    # Build date mapping from headers: (y_position, date_string)
     now = datetime.now()
-    date_map: list[tuple[float, str]] = []  # (y_position, date_string)
+    date_map: list[tuple[float, str]] = []
 
     for dh in raw.get("dateHeaders", []):
         day = dh.get("day", 0)
@@ -330,21 +352,32 @@ def _parse_dom_schedule(raw: dict) -> list[Lesson]:
         month = DUTCH_MONTHS.get(month_name, 0)
         if day and month:
             year = now.year
-            # Handle year boundary
             if month < now.month - 1:
                 year += 1
             date_str = f"{year}-{month:02d}-{day:02d}"
-            y = dh.get("rect", {}).get("y", 0)
+            y = dh.get("y", 0)
             date_map.append((y, date_str))
 
     date_map.sort()
     fallback_date = now.strftime("%Y-%m-%d")
+    logger.info("Date headers: %s", [(d, y) for y, d in date_map])
+
+    def _date_for_y(y: float) -> str:
+        """Find the date for a lesson based on its Y position relative to date headers."""
+        result = fallback_date
+        for header_y, date_str in date_map:
+            if y >= header_y:
+                result = date_str
+            else:
+                break
+        return result
 
     for item in raw.get("results", []):
         text = item.get("text", "")
         time_start = item.get("timeStart", "")
         time_end = item.get("timeEnd", "")
         after_time = item.get("afterTime", "")
+        lesson_y = item.get("y", 0)
 
         # Parse name: typically the first word(s) after the time
         # Format seen: "08:00 - 09:00  BodyPump\n60 min Conny Zaal 1"
@@ -354,23 +387,26 @@ def _parse_dom_schedule(raw: dict) -> list[Lesson]:
         location = ""
 
         if len(lines) >= 2:
-            # Second line usually: "60 min Instructor Location"
+            # Second line: "60 min Conny Zaal 1" or "45 min Marian Zaal 2"
             detail = lines[1]
             # Remove duration prefix like "60 min" or "45 min"
             detail = re.sub(r"^\d+\s*min\s*", "", detail).strip()
-            # Try to split instructor and location
-            parts = detail.rsplit(" ", 1)
-            if len(parts) == 2 and any(
-                kw in parts[1].lower()
-                for kw in ["zaal", "studio", "zone", "sgt", "supercycle"]
-            ):
-                instructor = parts[0]
-                location = parts[1]
+            # Try to split: last word(s) may be location (Zaal 1, SuperCycle Zaal, etc.)
+            # Common location patterns: "Zaal 1", "Zaal 2", "SuperCycle Zaal",
+            # "Functionele Zone SGT", "Online Groepslessen"
+            loc_match = re.search(
+                r"\s+((?:Zaal|Studio|SuperCycle|Functionele|Online)\s*.*)$",
+                detail,
+                re.IGNORECASE,
+            )
+            if loc_match:
+                location = loc_match.group(1).strip()
+                instructor = detail[: loc_match.start()].strip()
             else:
                 instructor = detail
 
-        # Determine date (use fallback)
-        date = fallback_date
+        # Assign correct date based on vertical position
+        date = _date_for_y(lesson_y)
 
         lesson = Lesson(
             name=name,
@@ -379,7 +415,7 @@ def _parse_dom_schedule(raw: dict) -> list[Lesson]:
             time_end=time_end,
             instructor=instructor,
             location=location,
-            bookable=True,  # If it's listed on the public schedule, assume bookable
+            bookable=True,  # Listed on the public schedule = bookable
         )
 
         if lesson.uid not in seen:
