@@ -16,8 +16,8 @@ class Settings(BaseSettings):
 
     poll_interval_seconds: int = 300
 
-    # How many weeks ahead to scrape (default: 2)
-    weeks_ahead: int = 2
+    # How many weeks ahead to scrape (default: 3)
+    weeks_ahead: int = 3
 
 
 settings = Settings()  # type: ignore[call-arg]

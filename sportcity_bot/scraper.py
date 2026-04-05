@@ -454,29 +454,21 @@ async def _click_next_week(page) -> bool:
     """)
     logger.info("Current week header: %r", old_header)
 
-    # Click the forward arrow SVG — it's the last SVG in the week-navigator
+    # Click the forward arrow SVG — it's always the LAST SVG in the week-navigator
+    # (DOM order: left-arrow SVG, h4 header, right-arrow SVG)
+    # We must always use the last one because on inner pages both SVGs have "active"
     clicked = await page.evaluate("""
         () => {
             const nav = document.querySelector('[class*="week-navigator"]');
             if (!nav) return 'no_navigator';
 
-            // The forward arrow is the last SVG, or the one with "active" in class
             const svgs = nav.querySelectorAll('svg');
             if (svgs.length === 0) return 'no_svgs';
 
-            // Prefer the one with "active" class (forward arrow)
-            for (const svg of svgs) {
-                const cls = (svg.className.baseVal || svg.getAttribute('class') || '');
-                if (cls.includes('active')) {
-                    svg.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                    return 'clicked_active_svg';
-                }
-            }
-
-            // Fallback: click the last SVG (right-side arrow)
-            const last = svgs[svgs.length - 1];
-            last.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-            return 'clicked_last_svg';
+            // Always click the last SVG — that's the forward/right arrow
+            const forward = svgs[svgs.length - 1];
+            forward.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+            return 'clicked_forward_svg';
         }
     """)
     logger.info("Click result: %s", clicked)
