@@ -439,105 +439,55 @@ async def _extract_current_week(page) -> dict:
 async def _click_next_week(page) -> bool:
     """Click the forward arrow to go to the next week. Returns True if successful.
 
-    Uses JavaScript to find clickable elements near the "Week" header text,
-    since CSS selectors are fragile against the PerfectGym DOM.
+    The SportCity schedule has a week-navigator div containing:
+      <svg class="...navigation-button">  (left/back arrow)
+      <h4>Week 14, 06 apr - 12 apr</h4>
+      <svg class="...navigation-button ...active">  (right/forward arrow)
+    The forward arrow is the last SVG in the week-navigator container.
     """
-    # Capture the current week header text so we can verify navigation worked
+    # Read the current week header to verify navigation worked
     old_header = await page.evaluate("""
         () => {
-            const els = document.querySelectorAll('*');
-            for (const el of els) {
-                const t = (el.innerText || '').trim();
-                if (/^Week\\s+\\d/i.test(t) && t.length < 80) return t;
-            }
-            return '';
+            const h = document.querySelector('[class*="week-navigator"] h4');
+            return h ? h.innerText.trim() : '';
         }
     """)
     logger.info("Current week header: %r", old_header)
 
-    # Strategy 1: JavaScript — find a clickable element after/near the "Week XX" text
-    # that looks like a forward arrow (>, →, ›, chevron SVG, etc.)
+    # Click the forward arrow SVG — it's the last SVG in the week-navigator
     clicked = await page.evaluate("""
         () => {
-            // Find the element containing "Week XX"
-            const allEls = [...document.querySelectorAll('*')];
-            let weekEl = null;
-            for (const el of allEls) {
-                const t = (el.innerText || '').trim();
-                if (/^Week\\s+\\d/i.test(t) && t.length < 80) {
-                    weekEl = el;
-                    break;
-                }
-            }
-            if (!weekEl) return 'no_week_header';
+            const nav = document.querySelector('[class*="week-navigator"]');
+            if (!nav) return 'no_navigator';
 
-            // Look for clickable siblings/nearby elements that are arrows
-            const parent = weekEl.parentElement;
-            if (!parent) return 'no_parent';
+            // The forward arrow is the last SVG, or the one with "active" in class
+            const svgs = nav.querySelectorAll('svg');
+            if (svgs.length === 0) return 'no_svgs';
 
-            // Search within the parent container and its parent
-            const containers = [parent, parent.parentElement].filter(Boolean);
-            for (const container of containers) {
-                // Find all clickable things: links, buttons, elements with onclick
-                const clickables = container.querySelectorAll('a, button, [role="button"], [onclick], svg');
-                for (const el of clickables) {
-                    const text = (el.innerText || el.textContent || '').trim();
-                    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
-                    const className = (el.className || '').toString().toLowerCase();
-                    const rect = el.getBoundingClientRect();
-
-                    // Must be to the RIGHT of the week header
-                    const weekRect = weekEl.getBoundingClientRect();
-                    const isRight = rect.left >= weekRect.right - 20;
-
-                    // Check if it looks like a forward arrow
-                    const isArrow = (
-                        text === '→' || text === '>' || text === '›' || text === '»' ||
-                        text === '\\u203A' || text === '\\u2192' ||
-                        ariaLabel.includes('next') || ariaLabel.includes('volgende') ||
-                        ariaLabel.includes('forward') ||
-                        className.includes('next') || className.includes('right') ||
-                        className.includes('forward') || className.includes('chevron')
-                    );
-
-                    // Also check for SVGs (arrow icons without text)
-                    const isSvgArrow = el.tagName === 'svg' || el.querySelector('svg');
-
-                    if (isRight && (isArrow || isSvgArrow)) {
-                        el.click();
-                        return 'clicked_arrow';
-                    }
+            // Prefer the one with "active" class (forward arrow)
+            for (const svg of svgs) {
+                const cls = (svg.className.baseVal || svg.getAttribute('class') || '');
+                if (cls.includes('active')) {
+                    svg.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                    return 'clicked_active_svg';
                 }
             }
 
-            // Strategy 2: Just click the last clickable thing in the week header container
-            // (often the forward arrow is the last child)
-            for (const container of containers) {
-                const clickables = [...container.querySelectorAll('a, button, [role="button"]')];
-                if (clickables.length >= 2) {
-                    // Last one is usually the forward arrow
-                    clickables[clickables.length - 1].click();
-                    return 'clicked_last_in_container';
-                }
-            }
-
-            return 'no_arrow_found';
+            // Fallback: click the last SVG (right-side arrow)
+            const last = svgs[svgs.length - 1];
+            last.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+            return 'clicked_last_svg';
         }
     """)
-    logger.info("JS click result: %s", clicked)
+    logger.info("Click result: %s", clicked)
 
-    if clicked in ("clicked_arrow", "clicked_last_in_container"):
+    if clicked.startswith("clicked"):
         await page.wait_for_timeout(4000)
 
-        # Verify the header actually changed
         new_header = await page.evaluate("""
             () => {
-                const els = document.querySelectorAll('*');
-                for (const el of els) {
-                    const t = (el.innerText || '').trim();
-                    if (/^Week\\s+\\d/i.test(t) && t.length < 80) return t;
-                }
-                return '';
+                const h = document.querySelector('[class*="week-navigator"] h4');
+                return h ? h.innerText.trim() : '';
             }
         """)
         logger.info("New week header: %r", new_header)
@@ -545,39 +495,7 @@ async def _click_next_week(page) -> bool:
             return True
         logger.warning("Week header did not change after click")
 
-    # Strategy 3: Try common CSS selectors
-    css_selectors = [
-        "button:has-text('→')",
-        "a:has-text('→')",
-        "button:has-text('>')",
-        "a:has-text('>')",
-        "[class*='next']",
-        "[aria-label*='next']",
-        "[aria-label*='volgende']",
-    ]
-    for selector in css_selectors:
-        try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=500):
-                await btn.click()
-                await page.wait_for_timeout(4000)
-                new_header = await page.evaluate("""
-                    () => {
-                        const els = document.querySelectorAll('*');
-                        for (const el of els) {
-                            const t = (el.innerText || '').trim();
-                            if (/^Week\\s+\\d/i.test(t) && t.length < 80) return t;
-                        }
-                        return '';
-                    }
-                """)
-                if new_header and new_header != old_header:
-                    logger.info("CSS selector %s worked, new header: %r", selector, new_header)
-                    return True
-        except Exception:
-            continue
-
-    logger.warning("All forward navigation attempts failed")
+    logger.warning("Forward navigation failed (result: %s)", clicked)
     return False
 
 
