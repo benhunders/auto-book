@@ -437,56 +437,147 @@ async def _extract_current_week(page) -> dict:
 
 
 async def _click_next_week(page) -> bool:
-    """Click the forward arrow to go to the next week. Returns True if successful."""
-    # The arrow is next to "Week XX, DD mmm - DD mmm"
-    # Look for a clickable forward arrow element
-    next_selectors = [
+    """Click the forward arrow to go to the next week. Returns True if successful.
+
+    Uses JavaScript to find clickable elements near the "Week" header text,
+    since CSS selectors are fragile against the PerfectGym DOM.
+    """
+    # Capture the current week header text so we can verify navigation worked
+    old_header = await page.evaluate("""
+        () => {
+            const els = document.querySelectorAll('*');
+            for (const el of els) {
+                const t = (el.innerText || '').trim();
+                if (/^Week\\s+\\d/i.test(t) && t.length < 80) return t;
+            }
+            return '';
+        }
+    """)
+    logger.info("Current week header: %r", old_header)
+
+    # Strategy 1: JavaScript — find a clickable element after/near the "Week XX" text
+    # that looks like a forward arrow (>, →, ›, chevron SVG, etc.)
+    clicked = await page.evaluate("""
+        () => {
+            // Find the element containing "Week XX"
+            const allEls = [...document.querySelectorAll('*')];
+            let weekEl = null;
+            for (const el of allEls) {
+                const t = (el.innerText || '').trim();
+                if (/^Week\\s+\\d/i.test(t) && t.length < 80) {
+                    weekEl = el;
+                    break;
+                }
+            }
+            if (!weekEl) return 'no_week_header';
+
+            // Look for clickable siblings/nearby elements that are arrows
+            const parent = weekEl.parentElement;
+            if (!parent) return 'no_parent';
+
+            // Search within the parent container and its parent
+            const containers = [parent, parent.parentElement].filter(Boolean);
+            for (const container of containers) {
+                // Find all clickable things: links, buttons, elements with onclick
+                const clickables = container.querySelectorAll('a, button, [role="button"], [onclick], svg');
+                for (const el of clickables) {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                    const className = (el.className || '').toString().toLowerCase();
+                    const rect = el.getBoundingClientRect();
+
+                    // Must be to the RIGHT of the week header
+                    const weekRect = weekEl.getBoundingClientRect();
+                    const isRight = rect.left >= weekRect.right - 20;
+
+                    // Check if it looks like a forward arrow
+                    const isArrow = (
+                        text === '→' || text === '>' || text === '›' || text === '»' ||
+                        text === '\\u203A' || text === '\\u2192' ||
+                        ariaLabel.includes('next') || ariaLabel.includes('volgende') ||
+                        ariaLabel.includes('forward') ||
+                        className.includes('next') || className.includes('right') ||
+                        className.includes('forward') || className.includes('chevron')
+                    );
+
+                    // Also check for SVGs (arrow icons without text)
+                    const isSvgArrow = el.tagName === 'svg' || el.querySelector('svg');
+
+                    if (isRight && (isArrow || isSvgArrow)) {
+                        el.click();
+                        return 'clicked_arrow';
+                    }
+                }
+            }
+
+            // Strategy 2: Just click the last clickable thing in the week header container
+            // (often the forward arrow is the last child)
+            for (const container of containers) {
+                const clickables = [...container.querySelectorAll('a, button, [role="button"]')];
+                if (clickables.length >= 2) {
+                    // Last one is usually the forward arrow
+                    clickables[clickables.length - 1].click();
+                    return 'clicked_last_in_container';
+                }
+            }
+
+            return 'no_arrow_found';
+        }
+    """)
+    logger.info("JS click result: %s", clicked)
+
+    if clicked in ("clicked_arrow", "clicked_last_in_container"):
+        await page.wait_for_timeout(4000)
+
+        # Verify the header actually changed
+        new_header = await page.evaluate("""
+            () => {
+                const els = document.querySelectorAll('*');
+                for (const el of els) {
+                    const t = (el.innerText || '').trim();
+                    if (/^Week\\s+\\d/i.test(t) && t.length < 80) return t;
+                }
+                return '';
+            }
+        """)
+        logger.info("New week header: %r", new_header)
+        if new_header and new_header != old_header:
+            return True
+        logger.warning("Week header did not change after click")
+
+    # Strategy 3: Try common CSS selectors
+    css_selectors = [
         "button:has-text('→')",
         "a:has-text('→')",
+        "button:has-text('>')",
+        "a:has-text('>')",
         "[class*='next']",
-        "[class*='forward']",
         "[aria-label*='next']",
         "[aria-label*='volgende']",
     ]
-
-    # Also try: the right arrow near the week header
-    # From the screenshot it's a simple "→" link/button near the week title
-    for selector in next_selectors:
+    for selector in css_selectors:
         try:
             btn = page.locator(selector).first
-            if await btn.is_visible(timeout=1000):
+            if await btn.is_visible(timeout=500):
                 await btn.click()
-                await page.wait_for_timeout(3000)  # Wait for new week to load
-                return True
+                await page.wait_for_timeout(4000)
+                new_header = await page.evaluate("""
+                    () => {
+                        const els = document.querySelectorAll('*');
+                        for (const el of els) {
+                            const t = (el.innerText || '').trim();
+                            if (/^Week\\s+\\d/i.test(t) && t.length < 80) return t;
+                        }
+                        return '';
+                    }
+                """)
+                if new_header and new_header != old_header:
+                    logger.info("CSS selector %s worked, new header: %r", selector, new_header)
+                    return True
         except Exception:
             continue
 
-    # Fallback: try to find any clickable element with an arrow-right SVG or "›" text
-    # near the week header
-    try:
-        # Look for SVG arrows or link elements near "Week" text
-        arrow = page.locator(
-            "svg[class*='arrow'], svg[class*='right'], "
-            "a[href*='week'], button[class*='arrow'], "
-            "[class*='week'] a, [class*='week'] button, "
-            "[class*='navigation'] a:last-child, "
-            "[class*='navigation'] button:last-child"
-        ).last
-        if await arrow.is_visible(timeout=1000):
-            await arrow.click()
-            await page.wait_for_timeout(3000)
-            return True
-    except Exception:
-        pass
-
-    # Last resort: try keyboard navigation
-    try:
-        await page.keyboard.press("ArrowRight")
-        await page.wait_for_timeout(3000)
-        return True
-    except Exception:
-        pass
-
+    logger.warning("All forward navigation attempts failed")
     return False
 
 
@@ -566,22 +657,44 @@ async def _scrape_with_playwright(
                     logger.warning("Could not navigate to next week, stopping")
                     break
 
-            if debug and week_num == 0:
+            if debug:
                 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+                suffix = f"_week{week_num}"
                 try:
                     await page.screenshot(
-                        path=str(DEBUG_DIR / "screenshot.png"), full_page=True
+                        path=str(DEBUG_DIR / f"screenshot{suffix}.png"), full_page=True
                     )
-                    logger.info("Screenshot: %s", DEBUG_DIR / "screenshot.png")
+                    logger.info("Screenshot: %s", DEBUG_DIR / f"screenshot{suffix}.png")
                 except Exception:
                     pass
+                if week_num == 0:
+                    try:
+                        html = await page.content()
+                        (DEBUG_DIR / "page.html").write_text(html, encoding="utf-8")
+                    except Exception:
+                        pass
+                    # Save the week navigation area HTML for debugging selectors
+                    try:
+                        nav_html = await page.evaluate("""
+                            () => {
+                                const els = document.querySelectorAll('*');
+                                for (const el of els) {
+                                    const t = (el.innerText || '').trim();
+                                    if (/^Week\\s+\\d/i.test(t) && t.length < 80) {
+                                        // Return the parent container's outer HTML
+                                        const p = el.parentElement?.parentElement || el.parentElement || el;
+                                        return p.outerHTML.substring(0, 5000);
+                                    }
+                                }
+                                return 'NO WEEK HEADER FOUND';
+                            }
+                        """)
+                        (DEBUG_DIR / "week_nav.html").write_text(nav_html, encoding="utf-8")
+                        logger.info("Week nav HTML saved to %s", DEBUG_DIR / "week_nav.html")
+                    except Exception:
+                        pass
                 try:
-                    html = await page.content()
-                    (DEBUG_DIR / "page.html").write_text(html, encoding="utf-8")
-                except Exception:
-                    pass
-                try:
-                    (DEBUG_DIR / "extraction.json").write_text(
+                    (DEBUG_DIR / f"extraction{suffix}.json").write_text(
                         json.dumps(raw, indent=2, default=str), encoding="utf-8"
                     )
                 except Exception:
