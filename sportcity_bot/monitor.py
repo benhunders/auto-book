@@ -85,6 +85,8 @@ class LessonMonitor:
             lessons = await scrape_schedule(
                 self.settings.sportcity_schedule_url,
                 weeks_ahead=self.settings.weeks_ahead,
+                email=self.settings.sportcity_email,
+                password=self.settings.sportcity_password,
             )
         except Exception as e:
             logger.error("Scrape failed: %s", e)

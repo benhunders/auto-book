@@ -278,6 +278,8 @@ async def _cb_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lessons = await scrape_schedule(
             settings.sportcity_schedule_url,
             weeks_ahead=settings.weeks_ahead,
+            email=settings.sportcity_email,
+            password=settings.sportcity_password,
         )
         names = {l.name for l in lessons}
         context.application.bot_data["known_lesson_names"] = names

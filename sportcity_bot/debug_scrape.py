@@ -12,6 +12,7 @@ import asyncio
 import logging
 import sys
 
+from .config import settings
 from .scraper import DEBUG_DIR, scrape_schedule
 
 logging.basicConfig(
@@ -27,7 +28,13 @@ async def main() -> None:
     print(f"Scraping: {url}")
     print(f"Debug output: {DEBUG_DIR}\n")
 
-    lessons = await scrape_schedule(url, weeks_ahead=2, debug=True)
+    lessons = await scrape_schedule(
+        url,
+        weeks_ahead=settings.weeks_ahead,
+        debug=True,
+        email=settings.sportcity_email,
+        password=settings.sportcity_password,
+    )
 
     print(f"\n{'='*60}")
 

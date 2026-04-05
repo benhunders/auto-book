@@ -1,12 +1,14 @@
 """Scrape the SportCity group lesson schedule.
 
 SportCity uses PerfectGym as their gym management platform. The schedule data
-can be obtained two ways:
+can be obtained three ways:
 
-1. **Direct API** (preferred): Hit the SportCity Next.js API or PerfectGym API
-   to get structured JSON data — no browser needed.
-2. **Playwright fallback**: Render the page in a headless browser and extract
-   lesson data from the DOM text content.
+1. **Authenticated API** (best): Log in with member credentials to get 2+ weeks
+   of structured JSON data directly from PerfectGym.
+2. **Unauthenticated API** (limited): Hit known endpoints without auth — usually
+   returns 404 but kept as a fallback.
+3. **Playwright fallback**: Render the page in a headless browser and extract
+   lesson data from the DOM text content (public schedule, ~1 week only).
 """
 
 from __future__ import annotations
@@ -117,19 +119,117 @@ async def _find_club_id(client: httpx.AsyncClient, club_slug: str) -> int | None
     return None
 
 
-async def _fetch_classes_from_perfectgym(
+async def _perfectgym_login(
+    client: httpx.AsyncClient, email: str, password: str
+) -> bool:
+    """Log in to PerfectGym and store session cookies on the client.
+
+    PerfectGym uses cookie-based auth. After a successful login, subsequent
+    requests on the same client will include the session cookies automatically.
+    """
+    login_endpoints = [
+        f"{PERFECTGYM_API}/Api/Auth/Login",
+        f"{PERFECTGYM_API}/Api/v2/Auth/Login",
+        f"{PERFECTGYM_API}/Api/Auth/Logon",
+    ]
+
+    payload = {"Login": email, "Password": password, "RememberMe": True}
+    alt_payload = {"email": email, "password": password, "rememberMe": True}
+
+    for url in login_endpoints:
+        for body in (payload, alt_payload):
+            try:
+                resp = await client.post(url, json=body, headers={
+                    **HEADERS,
+                    "Content-Type": "application/json",
+                })
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code in (200, 201):
+                    logger.info("PerfectGym login success via %s", url)
+                    return True
+                logger.debug(
+                    "PerfectGym login %s returned %d: %s",
+                    url, resp.status_code, resp.text[:200],
+                )
+            except Exception as e:
+                logger.debug("PerfectGym login error (%s): %s", url, e)
+
+    logger.warning("PerfectGym login failed for %s", email)
+    return False
+
+
+async def _fetch_classes_authenticated(
+    client: httpx.AsyncClient, club_id: int, weeks_ahead: int = 3
+) -> list[dict]:
+    """Fetch class schedule using an authenticated PerfectGym session.
+
+    Members can see ~2 weeks ahead vs ~1 week for public access.
+    """
+    today = datetime.now()
+    start = today.strftime("%Y-%m-%dT00:00:00")
+    end = (today + timedelta(days=7 * (weeks_ahead + 1))).strftime("%Y-%m-%dT23:59:59")
+
+    # Endpoints that typically work with auth
+    endpoints = [
+        f"{PERFECTGYM_API}/Api/Classes/ClassCalendar",
+        f"{PERFECTGYM_API}/Api/v2/Classes/ClassCalendar",
+        f"{PERFECTGYM_API}/Api/Classes/Classes",
+        f"{PERFECTGYM_API}/Api/v2/Classes/Classes",
+        f"{PERFECTGYM_API}/Api/GroupActivities/GroupActivities",
+        f"{PERFECTGYM_API}/Api/v2/GroupActivities/GroupActivities",
+        f"{PERFECTGYM_API}/Api/Calendar/Classes",
+        f"{PERFECTGYM_API}/Api/v2/Calendar/Classes",
+    ]
+
+    params = {"clubId": club_id, "startDate": start, "endDate": end}
+
+    for url in endpoints:
+        try:
+            resp = await client.get(url, params=params, headers=HEADERS)
+            if resp.status_code == 404:
+                logger.debug("Authenticated endpoint not found: %s", url)
+                continue
+            if resp.status_code == 401:
+                logger.debug("Authenticated endpoint unauthorized: %s", url)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info("Authenticated API success: %s (%d bytes)", url, len(resp.content))
+
+            # Try to extract the class list from various response shapes
+            classes = []
+            if isinstance(data, list):
+                classes = data
+            elif isinstance(data, dict):
+                for key in ("data", "result", "elements", "classes", "items",
+                            "CalendarData", "calendarData"):
+                    if isinstance(data.get(key), list):
+                        classes = data[key]
+                        break
+
+            if classes:
+                logger.info(
+                    "Authenticated API returned %d classes from %s", len(classes), url
+                )
+                return classes
+        except httpx.HTTPStatusError as e:
+            logger.debug("Authenticated endpoint HTTP error (%s): %s", url, e)
+        except Exception as e:
+            logger.debug("Authenticated endpoint error (%s): %s", url, e)
+
+    logger.warning("No authenticated PerfectGym endpoint returned classes")
+    return []
+
+
+async def _fetch_classes_unauthenticated(
     client: httpx.AsyncClient, club_id: int
 ) -> list[dict]:
-    """Fetch class schedule directly from PerfectGym API.
-
-    Tries multiple API endpoint patterns since the exact path varies
-    between PerfectGym versions and deployments.
-    """
+    """Fetch class schedule without auth (usually returns 404 but worth trying)."""
     today = datetime.now()
     start = today.strftime("%Y-%m-%dT00:00:00")
     end = (today + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59")
 
-    # Try multiple known PerfectGym API patterns
     endpoints = [
         f"{PERFECTGYM_API}/Api/v2/Classes/Classes",
         f"{PERFECTGYM_API}/Api/Classes/Classes",
@@ -145,11 +245,10 @@ async def _fetch_classes_from_perfectgym(
         try:
             resp = await client.get(url, params=params, headers=HEADERS)
             if resp.status_code == 404:
-                logger.debug("PerfectGym endpoint not found: %s", url)
                 continue
             resp.raise_for_status()
             data = resp.json()
-            logger.info("PerfectGym API success: %s", url)
+            logger.info("Unauthenticated API success: %s", url)
             if isinstance(data, list):
                 return data
             if isinstance(data, dict):
@@ -159,10 +258,9 @@ async def _fetch_classes_from_perfectgym(
         except httpx.HTTPStatusError:
             continue
         except Exception as e:
-            logger.debug("PerfectGym endpoint error (%s): %s", url, e)
-            continue
+            logger.debug("Unauthenticated endpoint error (%s): %s", url, e)
 
-    logger.warning("No PerfectGym API endpoint returned classes")
+    logger.warning("No unauthenticated PerfectGym endpoint returned classes")
     return []
 
 
@@ -639,38 +737,67 @@ def _extract_club_slug(url: str) -> str:
 
 
 async def scrape_schedule(
-    url: str, weeks_ahead: int = 2, debug: bool = False
+    url: str,
+    weeks_ahead: int = 3,
+    debug: bool = False,
+    email: str = "",
+    password: str = "",
 ) -> list[Lesson]:
-    """Scrape the SportCity schedule. Tries direct API first, falls back to Playwright.
+    """Scrape the SportCity schedule.
+
+    Tries authenticated API first (2+ weeks), then unauthenticated API,
+    then falls back to Playwright (public schedule, ~1 week).
 
     Args:
         url: The groepslesrooster page URL.
         weeks_ahead: How many additional weeks to scrape beyond the current one.
         debug: Save screenshots and extraction data for debugging.
+        email: SportCity member email (for authenticated API access).
+        password: SportCity member password.
     """
     logger.info("Scraping schedule from %s (%d weeks ahead)", url, weeks_ahead)
     club_slug = _extract_club_slug(url)
     logger.info("Club slug: %s", club_slug)
 
-    # Strategy 1: Try PerfectGym API directly
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         club_id = await _find_club_id(client, club_slug)
 
         if club_id:
-            classes = await _fetch_classes_from_perfectgym(client, club_id)
+            # Strategy 1: Authenticated PerfectGym API (members see 2+ weeks)
+            if email and password:
+                logger.info("Attempting authenticated API access for %s", email)
+                if await _perfectgym_login(client, email, password):
+                    classes = await _fetch_classes_authenticated(
+                        client, club_id, weeks_ahead=weeks_ahead
+                    )
+                    if classes:
+                        lessons = _parse_perfectgym_classes(classes)
+                        if lessons:
+                            logger.info(
+                                "Authenticated API: found %d lessons (%d bookable)",
+                                len(lessons),
+                                sum(1 for l in lessons if l.bookable),
+                            )
+                            return lessons
+                logger.info("Authenticated API did not return lessons")
+            else:
+                logger.info("No credentials configured, skipping authenticated API")
+
+            # Strategy 2: Unauthenticated PerfectGym API
+            classes = await _fetch_classes_unauthenticated(client, club_id)
             if classes:
                 lessons = _parse_perfectgym_classes(classes)
                 if lessons:
                     logger.info(
-                        "PerfectGym API: found %d lessons (%d bookable)",
+                        "Unauthenticated API: found %d lessons (%d bookable)",
                         len(lessons),
                         sum(1 for l in lessons if l.bookable),
                     )
                     return lessons
 
-        logger.info("Direct API did not return lessons, falling back to Playwright")
+        logger.info("API did not return lessons, falling back to Playwright")
 
-    # Strategy 2: Playwright DOM extraction with week navigation
+    # Strategy 3: Playwright DOM extraction with week navigation
     lessons = await _scrape_with_playwright(url, weeks_ahead=weeks_ahead, debug=debug)
     logger.info(
         "Playwright: found %d lessons (%d bookable)",
