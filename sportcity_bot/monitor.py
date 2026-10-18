@@ -92,6 +92,13 @@ class LessonMonitor:
             logger.error("Scrape failed: %s", e)
             return []
 
+        # An empty result means the scrape failed silently (e.g. page timeout).
+        # Treat it like an error so we don't wipe the seen/notified state and
+        # re-notify every watched lesson on the next successful scrape.
+        if not lessons:
+            logger.warning("Scrape returned no lessons, keeping previous state")
+            return []
+
         # Update bot status and known lesson names for the picker UI
         self.app.bot_data["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.app.bot_data["lessons_found"] = len(lessons)
